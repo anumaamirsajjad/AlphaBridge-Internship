@@ -1,3 +1,6 @@
+# Keeps the Docker project name fixed, so the database volume name does not change if this folder is renamed.
+name: banking-db
+
 # Line-by-line notes: lines starting with # are comments and are ignored by Docker.
 # What this file does:
 #   Describes the whole local environment as two containers:
