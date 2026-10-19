@@ -1,0 +1,19 @@
+# Line-by-line notes: lines starting with # are comments. Docker ignores them.
+# What this file does:
+#   Lists files and folders Docker must NOT copy into the image.
+#   Keeps the image small and keeps secrets and Windows-only files out of it.
+#   Each non-comment line is a path pattern. Comments must be on their own line.
+
+# Local virtual environment (Windows-specific, not needed in the container). Skips the whole .venv folder.
+.venv
+# Python cache folders. ** means "any folder at any depth".
+**/__pycache__
+# Pytest's cache folder.
+.pytest_cache
+# Local secrets file. The container gets its settings from docker-compose.yml instead.
+.env
+# This file list and the Dockerfile are not needed inside the image.
+.dockerignore
+Dockerfile
+# Test code is not needed to run the API.
+tests

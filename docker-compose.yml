@@ -1,0 +1,49 @@
+# Line-by-line notes: lines starting with # are comments and are ignored by Docker.
+# What this file does:
+#   Describes the whole local environment as two containers:
+#     db   - PostgreSQL database (created from the official postgres:16 image)
+#     api  - the FastAPI application (built from the Dockerfile in ./api)
+#   Start everything with:  docker compose up -d --build
+#   Stop it with:           docker compose down
+#
+# Values such as passwords are written here for local development only.
+
+services:  # Top-level key: the list of containers to run. Each child key below is one container.
+  db:  # Name of the first service. Other services can reach it by this name ("db").
+    image: postgres:16  # Use the official PostgreSQL image, version 16, downloaded from Docker Hub.
+    container_name: banking-postgres  # Fixed name for the container, so commands like "docker exec banking-postgres" work.
+    restart: unless-stopped  # Restart automatically after a crash or reboot, unless you stopped it yourself.
+    environment:  # Variables set inside the container.
+      # Used only when the database is created for the first time.
+      POSTGRES_DB: banking_db  # Name of the database to create.
+      POSTGRES_USER: banking_user  # Name of the database user to create.
+      POSTGRES_PASSWORD: local_dev_password  # Password for that user.
+    ports:  # Port mapping: "Windows port:container port".
+      - "5432:5432"  # Windows port 5432 -> container port 5432, so tools on Windows can connect.
+    volumes:  # Storage mappings: "where on the host or volume : where inside the container".
+      # Named volume: keeps the database files even if the container is removed.
+      - postgres_data:/var/lib/postgresql/data  # Store the database files in the named volume postgres_data.
+      # Runs the SQL files in ./init once, on the first start (when the volume is empty).
+      - ./init:/docker-entrypoint-initdb.d:ro  # Share the init folder read-only, so the first start runs the SQL files.
+    healthcheck:  # Tells Docker how to check the database is working.
+      # Checks every 5 seconds that the database accepts connections.
+      test: ["CMD-SHELL", "pg_isready -U banking_user -d banking_db"]  # Run pg_isready (a PostgreSQL status check). Its exit code says healthy or not.
+      interval: 5s  # Run the check every 5 seconds.
+      timeout: 3s  # Give up on one check after 3 seconds.
+      retries: 10  # Mark unhealthy only after 10 failed checks in a row.
+
+  api:  # The second service: our FastAPI app.
+    build: ./api  # Build the image from the Dockerfile in the api folder.
+    container_name: banking-api  # Fixed container name.
+    restart: unless-stopped  # Restart automatically, as for the database.
+    environment:  # Variables set inside the API container.
+      # Inside Docker, the database is reached by its service name "db", not "localhost".
+      DATABASE_URL: postgresql://banking_user:local_dev_password@db:5432/banking_db  # Connection string. The host is "db" (the service above), not localhost.
+    ports:  # Port mapping for the API.
+      - "8081:8000"  # Windows port 8081 -> port 8000 inside the container (where uvicorn listens).
+    depends_on:  # Start order rules.
+      db:  # Wait for the db service.
+        condition: service_healthy  # Start the API only after the database health check passes.
+
+volumes:  # Declares the named volumes used by services.
+  postgres_data:  # Creates the volume called postgres_data, managed by Docker.

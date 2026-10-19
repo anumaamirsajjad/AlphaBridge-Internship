@@ -1,0 +1,9 @@
+# Local virtual environment (Windows-specific).
+api/.venv/
+
+# Python and test caches (generated automatically).
+__pycache__/
+.pytest_cache/
+
+# Local secrets. Never commit real passwords or API keys.
+.env

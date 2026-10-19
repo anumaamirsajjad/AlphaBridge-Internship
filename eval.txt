@@ -1,0 +1,404 @@
+BANKING API - PRINCIPLES, PRACTICES, AUTHORIZATION AND DOCKER WRITEUP
+======================================================================
+
+Scope: the API in api\ (main.py, banking.py, schemas.py, database.py,
+create_api_key.py), the SQL in init\, the tests in api\tests\, and the Docker
+setup (api\Dockerfile, docker-compose.yml).
+
+
+0. WHAT CHANGED IN THIS VERSION
+-------------------------------
+Two changes:
+
+1. AUTHORIZATION WAS ADDED. Earlier versions had no check on who was calling.
+   Anyone who could reach the port could move money. Now:
+   - Every call except the health check needs an API key (X-API-Key header).
+   - A client can only send money from accounts it owns.
+   - A client can only see, cancel, refund or edit transactions it is part of.
+   - Keys are stored as SHA-256 hashes. The real key is shown once, when created.
+
+2. THE PROJECT WAS TIDIED. The app is four Python files at the top of api\,
+   the SQL setup is in init\ (three files, run in order), tests live in
+   api\tests\, generated caches are excluded by .gitignore, and a README
+   explains how to run and use it.
+
+The earlier change (about 14 Python files reduced to 4) kept the same URLs and
+rules, and the original 35 tests still pass unchanged in behaviour.
+
+
+1. PROJECT LAYOUT (WHAT EACH FILE DOES)
+---------------------------------------
+
+README.md              How to run, create a key, and test. Start here.
+docker-compose.yml     Starts two containers: the database and the API.
+init\01_schema.sql     Tables: accounts, transactions, refunds, cancellations,
+                       idempotency keys. Runs once, on an empty database.
+init\02_...sql         Version column (PATCH) and the cancel/refund idempotency table.
+init\03_api_clients.sql  API clients and the accounts each may use.
+api\main.py            Routes, the API-key check, the Idempotency-Key and
+                       If-Match headers, and error replies.
+api\banking.py         Banking rules, access rules, and the SQL that carries them out.
+                       One class per transaction type: TransferService,
+                       CancellationService, RefundService, TransactionService.
+api\schemas.py         The shape of every request and reply (Pydantic).
+api\database.py        Opens database connections. Commits or rolls back per request.
+api\create_api_key.py  Tool: creates a client, its API key, and its accounts.
+api\tests\conftest.py  Test database setup, fixtures, and shared helpers.
+api\tests\test_transactions.py  Money behaviour: transfers, retries, cancel, refund, PATCH.
+api\tests\test_auth.py Authorization: keys, ownership, and what must be refused.
+api\Dockerfile         Builds the API image (copies the four app files).
+api\.dockerignore      Keeps .venv, .env, tests and caches out of the image.
+
+How one request travels through the files:
+
+  HTTP request + X-API-Key
+     -> main.py        check the key (check_api_key), read the headers,
+                       check the body against schemas.py
+     -> database.py    open one connection for this request
+     -> banking.py     check ownership and rules, run the SQL on that connection
+     -> database.py    commit if all went well, roll back if not
+     -> main.py        turn the result or the error into an HTTP reply
+
+
+2. SOLID PRINCIPLES (IMPLEMENTED IN THIS CODE)
+----------------------------------------------
+SOLID is five rules for keeping code easy to read and safe to change. Three of
+them are implemented in this code. Each one is explained below with the place
+where it is applied and its limit.
+
+Single Responsibility Principle (SRP)
+  What it means: each piece of code has one job, so it has one reason to change.
+  How it is implemented:
+  - schemas.py    only defines the shapes of requests and replies, and their checks.
+  - database.py   only opens database connections, and commits or rolls them back.
+  - main.py       only handles HTTP: the routes, the X-API-Key check, the headers,
+                  and the error replies.
+  - banking.py    only the banking rules, the access rules, and the SQL that
+                  carries them out. Each transaction type has its own class
+                  (TransferService, CancellationService, RefundService,
+                  TransactionService), so each class has one job.
+  - create_api_key.py  only creates API clients.
+  Limit: banking.py holds both the rules and the SQL. The split is by file, not
+  by a separate layer for each.
+
+Open/Closed Principle (OCP)
+  What it means: code should be open to extension (you can add new behaviour)
+  but closed to modification (you do not have to change working code to add it).
+  How it is implemented:
+  - Every error is a subclass of BankingError in banking.py. A new error type is
+    a new class; nothing else has to change.
+  - main.py has one handler, banking_error_handler, registered for BankingError.
+    It serves every subclass, so it never has to be edited when one is added.
+  Limit: a new route still needs its function added to main.py.
+
+Liskov Substitution Principle (LSP)
+  What it means: anywhere a parent class is expected, a child class must work
+  without surprises. A child should be usable in its parent's place.
+  How it is implemented:
+  - BadRequestError, AuthenticationError, ForbiddenError, NotFoundError,
+    ConflictError, PreconditionFailedError, PreconditionRequiredError and
+    ServiceUnavailableError are all subclasses of BankingError.
+  - banking_error_handler only uses status_code and detail, which every
+    subclass provides. So any of them can be raised anywhere and produces the
+    correct HTTP reply, with no special case.
+  - The tests check the replies 400, 401, 403, 404, 409, 412 and 428, all of
+    which come from different subclasses through the same handler.
+
+
+3. GOOD CODING AND SECURITY PRACTICES
+-------------------------------------
+
+Authentication with API keys
+  Meaning: every caller proves who it is with a secret it holds.
+  How: the key is sent in the X-API-Key header. The database stores only its
+  SHA-256 hash. The key is generated with secrets.token_urlsafe(32), which gives
+  about 256 bits of randomness. The key is shown once, when created.
+  Why hashes: if the database leaks, the attacker gets hashes, not usable keys.
+
+Authorization on every money rule
+  Meaning: being logged in is not enough. Each action checks the caller may do it.
+  How: transfers check the source account is owned (403). Cancel, refund and
+  PATCH check the transaction's sender is owned. Reads check the caller is
+  sender or receiver. The checks are in banking.py, next to the rules they guard.
+  Refusals that would reveal a transaction's existence return 404, the same as
+  a missing transaction, so IDs cannot be probed.
+
+Keys are checked before any work
+  The key check runs first, before the body is read or any SQL runs.
+
+Validate at the boundary
+  Pydantic (schemas.py) rejects bad input with 422 before any rule runs.
+
+Exact numbers for money
+  DECIMAL in PostgreSQL and Decimal in Python. Floats cannot store 0.10 exactly.
+
+Parameterised SQL (prevents SQL injection)
+  Values are passed as placeholders (%s or %(name)s), never pasted into SQL
+  text. The only exception is TRANSACTION_COLUMNS, a constant that never comes
+  from user input.
+
+Explicit transaction boundaries
+  Each request runs in one transaction. Either every change is saved, or none is.
+
+Concurrency control
+  - Row locks (FOR UPDATE) stop two transfers changing the same balance at once.
+  - Advisory locks (pg_advisory_xact_lock) make requests with the same
+    Idempotency-Key run one after the other.
+  - Accounts are locked in account_id order, so two transfers cannot each wait
+    on the other forever (deadlock avoidance).
+
+Idempotency
+  Meaning: the same request sent twice has the same effect as sending it once.
+  A client that loses a reply can retry with the same Idempotency-Key. The API
+  returns the saved answer instead of moving money again. Requests are
+  fingerprinted (SHA-256 of sorted JSON), so a reused key with different content
+  gets 409.
+
+Optimistic locking (PATCH)
+  Meaning: each row has a version number. The client sends the version it last
+  saw (If-Match). If it has changed, the update is refused with 412, so an
+  overwrite of someone else's change cannot happen silently.
+
+Central error handling
+  Meaning: one place turns errors into HTTP replies. Database error text is never
+  sent to the caller.
+
+Fail fast
+  Missing DATABASE_URL, a missing key, a missing Idempotency-Key, and a
+  same-account transfer are all rejected immediately.
+
+Deterministic behaviour
+  Same input, same output. Pagination is ordered by created_at and then
+  transaction_id, so pages do not shift.
+
+Plain results
+  Each transaction method returns a pair: (answer, created). The caller can
+  see at once whether a new record was made (201) or an earlier one was
+  returned (200). Plain pairs keep the code short and easy to follow.
+
+Documentation that cannot drift
+  FastAPI builds Swagger UI (/docs) from the code. Each route shows its
+  inputs, including the X-API-Key and Idempotency-Key header fields.
+
+Automated tests (49)
+  35 behaviour tests and 14 authorization tests. They run the real app against a
+  separate banking_test database. Each test checks the reply and, for money,
+  the balances. The authorization tests check that refused calls move no money.
+
+Least-privilege container
+  The API container runs as a normal user (appuser), not root.
+
+Secrets stay out of the image and out of git
+  .dockerignore keeps .env and .venv out of the image. .gitignore keeps them
+  out of git. The one key in docker-compose.yml is a local development password.
+
+Pinned versions
+  requirements.txt pins exact versions, so every machine gets the same packages.
+
+Health checks and start order
+  The database has a pg_isready health check. The API starts only after the
+  database is healthy.
+
+Schema in SQL files
+  Tables are created by idempotent SQL files in init\, not by the app at startup.
+
+
+4. KNOWN GAPS (NOT YET DONE)
+----------------------------
+- NO HTTPS. The key travels in plain text over HTTP. On this local machine that
+  is acceptable, but a real deployment must sit behind HTTPS. Without it, anyone
+  on the network path can read the key.
+- NO KEY ROTATION OR EXPIRY. A key works until it is deleted. There is no tool
+  yet to revoke a key; it would be a row update on api_clients.
+- NO RATE LIMITING. A client with a valid key can send unlimited requests.
+- NO AUDIT LOG. Who did what is not recorded beyond the transaction rows.
+- NO PER-USER LOGIN. Keys identify an app or a client, not a named person.
+- Concurrency fixes are reasoned, not yet measured. They need a test with truly
+  parallel requests against the real database.
+- No connection pooling, no logging.
+
+
+5. BEHAVIOUR CHANGES TO BE AWARE OF
+-----------------------------------
+- Every route except the health check now requires X-API-Key (401 without it).
+- Transfers from an account you do not own return 403.
+- Reading, listing, cancelling, refunding or editing a transaction you are not
+  part of returns 404.
+- The list endpoint shows only your transactions.
+- Replaying another client's Idempotency-Key returns 409.
+- Amounts are returned as strings (e.g. "1.00").
+- Unknown JSON fields are rejected (422).
+- An ambiguous account name returns 409.
+- The first cancellation returns 201; a retry returns 200.
+- Small difference from the earlier tidy-up: the "same source and destination"
+  check runs after the database connection opens. If the database is down AND
+  the request is invalid, the reply is 503 instead of 400.
+
+
+6. WHY FASTAPI, AND THE OTHER TOOLS USED
+----------------------------------------
+FastAPI (web framework)
+  Builds the routes, parses requests, checks types, and generates Swagger at
+  /docs. Header(...) reads the X-API-Key and Idempotency-Key headers.
+
+Pydantic (validation)
+  Checks request bodies in schemas.py before any business code runs.
+
+psycopg 3 (PostgreSQL driver)
+  Runs parameterised SQL. Context managers commit on success and roll back on error.
+  dict_row returns rows as dictionaries.
+
+PostgreSQL 16 (database)
+  Enforces rules at the lowest level: CHECK constraints (no negative balance),
+  foreign keys, UNIQUE keys. Row locks and advisory locks handle concurrency.
+  DECIMAL stores money exactly.
+
+uvicorn (ASGI server)
+  Runs the FastAPI app on a port.
+
+pytest and FastAPI TestClient (tests)
+  Run the real app in memory against banking_test.
+
+Docker and Docker Compose (containers)
+  Package the API and PostgreSQL so they run the same way on any machine.
+
+
+7. DOCKER AND CONTAINERISATION
+------------------------------
+Why Docker
+  - The API and PostgreSQL run in containers with pinned versions (Python 3.12,
+    PostgreSQL 16, exact versions in requirements.txt). The same setup runs
+    on any machine.
+  - Each service is isolated. The database does not depend on what is
+    installed on Windows.
+
+What the containers are (docker-compose.yml)
+  - db   : postgres:16 image, container banking-postgres, port 5432.
+  - api  : built from api\Dockerfile, container banking-api, port 8081 on
+           Windows mapped to 8000 in the container.
+  - The API reaches the database as host "db", not "localhost".
+  - depends_on with service_healthy starts the API after the database is healthy.
+
+How the API image is built (api\Dockerfile)
+  1. FROM python:3.12-slim: a small official Python image.
+  2. COPY requirements.txt, then pip install: packages in their own layer, so
+     rebuilds after code changes are fast.
+  3. COPY main.py database.py banking.py schemas.py: the four app files, last.
+     create_api_key.py is a local tool and is not put in the image.
+  4. useradd and USER appuser: run as a non-root user.
+  5. CMD uvicorn main:app --host 0.0.0.0 --port 8000.
+
+Volumes (how data is kept)
+  - Named volume postgres_data: the database files, kept when containers are
+    recreated.
+  - Bind mount ./init:/docker-entrypoint-initdb.d:ro: PostgreSQL runs these SQL
+    files ONLY when the volume is empty (first start). An existing database must
+    have new files applied by hand (see section 8, step 9).
+
+Useful commands
+  - docker compose up -d --build   build images and start both containers
+  - docker compose ps              show container status
+  - docker compose logs -f api     follow the API logs
+  - docker compose down            stop and remove containers (volume kept)
+  - docker compose down -v         also DELETE the database volume (data lost)
+
+
+8. EVALUATOR QUESTIONS: HOW I SET UP DOCKER AND THE API
+-------------------------------------------------------
+Where I started
+  The database was already running in Docker (banking-postgres, postgres:16).
+  The API ran directly on Windows from the virtual environment, on port 8081.
+
+Steps 1 to 6 (first setup, Docker)
+  Step 1: checked Docker and the database container with "docker ps".
+  Step 2: wrote api\Dockerfile: start from a small Python 3.12 image, install
+  the requirements, copy the code, run as a normal user, start uvicorn.
+  Step 3: added api\.dockerignore so .venv, .env and tests stay out of the image.
+  Step 4: added the "api" service to docker-compose.yml, reaching the database as
+  "db" and keeping the Swagger address on port 8081.
+  Step 5: gave the database a health check, so the API waits for it.
+  Step 6: ran "docker compose up -d --build".
+
+Steps for the tests and checks
+  Step 1: wrote requirements.txt with exact versions from the working environment.
+  Step 2: wrote the automated tests against banking_test (35 passed).
+  Step 3: checked the database tables and balances.
+  Step 4: smoke-tested the containers: health check, Swagger, 400 for a missing
+  key, 422 for a bad amount, and the transaction list. No transfer was made.
+  Step 5: cleaned up comments and rebuilt; tests and health check still passed.
+
+Step 6 (reduction to four app files)
+  Replaced the layered structure with main.py, banking.py, schemas.py and
+  database.py. Updated the Dockerfile COPY line, removed the old package, and
+  ran the tests (all passed). Rebuilt and repeated the read-only smoke checks.
+
+Step 7 (authorization)
+  - Added init\03_api_clients.sql: api_clients (name, key hash) and
+    client_accounts (which accounts each client may use).
+  - Added the API-key check to main.py (check_api_key) and the ownership rules
+    to banking.py. Every route except health now needs a key.
+  - Added create_api_key.py to make a client, its key, and its accounts. Tested
+    it on banking_test: a valid name worked, and a bad account name saved nothing.
+  - Tests: moved the shared helpers into conftest.py, sent the test key by
+    default, and added test_auth.py (14 tests). All 49 passed.
+
+Step 8 (tidy-up)
+  Removed generated caches, added .gitignore and README.md, and removed the
+  empty tests\__init__.py (the tests import helpers from conftest directly).
+
+Step 9 (live database and rebuild)
+  - Applied init\03_api_clients.sql to the running banking_db with
+    "docker exec -i banking-postgres psql ..." (the init folder only runs on an
+    empty volume). The balances were checked before and after: unchanged.
+  - Rebuilt the containers. Checked over HTTP, with no transfer made:
+      health check without a key    -> 200
+      transactions without a key    -> 401
+      transactions with a wrong key -> 401
+      transfer without a key        -> 401, and balances unchanged
+  - Not done on purpose: a real key was not used against the live database,
+    so no money moved during checks. The authorization tests cover valid-key
+    behaviour against banking_test.
+
+Step 10 (evaluation writeup)
+  Section 2 was rewritten to list only the SOLID principles the code implements
+  (SRP, OCP, LSP), each with how it is applied. Principles that are not
+  implemented were removed from that section.
+
+Step 12 (plain-language rewrite)
+  The code was rewritten in simpler style for readability. Changes:
+  - banking.py: no dataclass, no named-helper layers, no type hints. Each
+    class method reads top to bottom: check, lock, change, save. The results
+    are plain (body, created) pairs instead of a result object.
+  - main.py: the API key and the Idempotency-Key and If-Match values are read
+    with plain Header(...) parameters and two small check functions. The
+    Depends/Security/Annotated layers and the per-route response tables were
+    removed. Swagger now shows the X-API-Key field on each route instead of
+    an Authorize button.
+  - schemas.py: field rules are written directly on each field, with one base
+    class for the shared settings. ErrorResponse was removed.
+  The rules, SQL and locks are the same. All 49 tests passed, and the rebuilt
+  containers refused unauthenticated calls with balances unchanged.
+
+Step 11 (one class per transaction type)
+  The transaction functions in banking.py were grouped into four classes:
+  TransferService (create), CancellationService (cancel), RefundService
+  (refund) and TransactionService (get, list_all, update_description). Each
+  class takes the database connection and the caller's client_id in its
+  constructor. The rules and SQL are unchanged. main.py now creates the class
+  for each request. All 49 tests passed, and the rebuilt containers answered
+  the health check (200) and refused unauthenticated calls (401) with balances
+  unchanged.
+
+
+9. HOW TO RUN IT AGAIN (IN SIMPLE STEPS)
+----------------------------------------
+  1. Open PowerShell: cd C:\Users\MTS\banking-db
+  2. Start everything: docker compose up -d --build
+  3. Open Swagger: http://127.0.0.1:8081/docs (fill in the X-API-Key field)
+  4. Make a key (once per client), from the api folder with DATABASE_URL set:
+       python create_api_key.py "Client name" "Account holder" ...
+     Copy the key when it is printed. It is shown only once.
+  5. Run the tests (optional): cd api, then .\.venv\Scripts\python.exe -m pytest
+  6. Look at logs if something fails: docker compose logs -f api
+  7. Stop when finished: docker compose down
+     (Keeps the database data. Do not add -v, because that deletes it.)
