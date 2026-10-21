@@ -1,7 +1,7 @@
 """The Banking API: the web addresses (routes) and their replies.
 
 Run it with:
-    uvicorn main:app --reload --host 127.0.0.1 --port 8081
+    uvicorn presentation.main:app --reload --host 127.0.0.1 --port 8081
 
 Every route except the health check needs an X-API-Key header.
 """
@@ -13,16 +13,16 @@ import psycopg
 from fastapi import FastAPI, Header, Query, Response
 from fastapi.responses import JSONResponse
 
-import banking
-from banking import (
+from business import banking
+from business.banking import (
     AuthenticationError,
     BadRequestError,
     BankingError,
     PreconditionRequiredError,
     ServiceUnavailableError,
 )
-from database import connect, database_is_available
-from schemas import (
+from data.database import connect, database_is_available
+from validation.schemas import (
     CancellationCreate,
     CancellationResponse,
     RefundCreate,
