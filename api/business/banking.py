@@ -16,7 +16,7 @@ import json
 
 from psycopg.types.json import Jsonb
 
-from schemas import CancellationResponse, RefundResponse
+from validation.schemas import CancellationResponse, RefundResponse
 
 
 # ---------------------------------------------------------------------------
