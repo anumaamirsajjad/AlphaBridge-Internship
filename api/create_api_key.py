@@ -15,8 +15,8 @@ Usage (run from the api folder, with DATABASE_URL set):
 import secrets
 import sys
 
-from banking import hash_api_key
-from database import connect
+from business.banking import hash_api_key
+from data.database import connect
 
 USAGE = 'Usage: python create_api_key.py "<client name>" "<account holder>" ["<account holder>" ...]'
 

@@ -33,8 +33,11 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 # Copy the application code. .dockerignore keeps .venv, .env and tests out.
-# COPY main.py database.py banking.py schemas.py ./ : copy the four app files into /app.
-COPY main.py database.py banking.py schemas.py ./
+# COPY presentation/ business/ data/ validation/ ./ : copy the four layer folders into /app.
+COPY presentation/ ./presentation/
+COPY business/ ./business/
+COPY data/ ./data/
+COPY validation/ ./validation/
 
 # Create a normal user and run the app as that user, not as root.
 # useradd --create-home: create the user and its home folder.
@@ -47,7 +50,7 @@ USER appuser
 EXPOSE 8000
 
 # CMD: the command that starts when the container starts.
-# uvicorn main:app runs the app named "app" in main.py.
+# uvicorn presentation.main:app runs the app named "app" in presentation/main.py.
 # --host 0.0.0.0 lets connections from outside the container reach the app.
 # --port 8000 is the port it listens on inside the container.
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "presentation.main:app", "--host", "0.0.0.0", "--port", "8000"]
