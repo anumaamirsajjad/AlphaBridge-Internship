@@ -1,0 +1,5 @@
+# Packages needed only by the test data seeder (api/seed/seed_faker.py).
+# The API image does not install these.
+-r requirements.txt
+# Makes realistic fake names and sentences.
+Faker==30.8.2
