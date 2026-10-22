@@ -1,0 +1,95 @@
+name: deploy-api
+
+on:
+  push:
+    branches: [transaction-feature, cicd-pipeline]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: alphabridge-api
+  ECS_CLUSTER: alphabridge-cluster
+  ECS_SERVICE: alphabridge-api-service
+  ECS_TASK_FAMILY: alphabridge-api
+  CONTAINER_NAME: alphabridge-api
+
+jobs:
+  # Runs the unit tests on every push and pull request. Nothing is deployed from here.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        working-directory: api
+        run: pip install -r requirements-dev.txt
+
+      - name: Run unit tests
+        working-directory: api
+        run: pytest
+
+  # Builds and deploys only from the transaction-feature branch, and only after the tests pass.
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/transaction-feature' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      # Logs in to AWS with a short-lived role. No access keys are stored in GitHub.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Tags each image with the commit ID, so every deploy is traceable.
+      - name: Build and push image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        working-directory: api
+        run: |
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      # Copies the current task definition and removes the fields ECS won't accept on register.
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition --task-definition "$ECS_TASK_FAMILY" --query taskDefinition \
+            | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
+            > task-definition.json
+
+      - name: Point container at the new image
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      # Registers the new revision and updates the service. Waits until the service is stable.
+      # If the new tasks fail, the ECS circuit breaker rolls back to the last working revision.
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
