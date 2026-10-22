@@ -5,12 +5,15 @@ What this file does:
     Every database call in the app goes through connect().
 """
 
+import logging
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 
 import psycopg
 from psycopg.rows import dict_row
+
+logger = logging.getLogger(__name__)
 
 
 # Opens one connection for one unit of work.
@@ -35,4 +38,6 @@ def database_is_available() -> bool:
             conn.execute("SELECT 1")
         return True
     except (psycopg.Error, RuntimeError):
+        # Writes the real error to the logs. The caller only sees "unavailable".
+        logger.exception("Database health check failed")
         return False
