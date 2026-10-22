@@ -1,0 +1,16 @@
+# Line-by-line notes: lines starting with # are comments. pip ignores them.
+# What this file does:
+#   Lists the packages the API needs to run, with exact versions.
+#   Install with: pip install -r requirements.txt
+#   The Dockerfile uses this file too.
+#
+# Format: package==version. The == pins the exact version, so every machine gets the same one.
+
+# Web framework: routes, validation, Swagger docs. Pinned to version 0.143.3.
+fastapi==0.143.3
+# Server that listens for HTTP requests and runs the FastAPI app.
+uvicorn==0.54.0
+# Data validation and models (used by FastAPI and schemas.py).
+pydantic==2.14.1
+# PostgreSQL driver. [binary] installs a ready-built part, so no C compiler is needed.
+psycopg[binary]==3.3.6

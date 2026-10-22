@@ -1,0 +1,11 @@
+# Line-by-line notes: lines starting with # are comments. pip ignores them.
+# What this file does:
+#   Lists the extra packages needed only for testing.
+#   Install with: pip install -r requirements-dev.txt
+
+# "-r requirements.txt" means "also install every package listed in requirements.txt".
+-r requirements.txt
+# The test framework that runs the tests in the tests folder. Pinned version.
+pytest==9.1.1
+# The HTTP library that FastAPI's TestClient uses to send requests in memory.
+httpx==0.28.1
