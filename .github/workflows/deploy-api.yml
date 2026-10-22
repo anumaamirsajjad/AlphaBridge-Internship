@@ -1,8 +1,10 @@
 name: deploy-api
 
 on:
+  # Tests run on a push to any branch (feature/*, develop, main, and so on).
   push:
-    branches: [transaction-feature, cicd-pipeline]
+    branches: ["**"]
+  # Tests also run on every pull request.
   pull_request:
   workflow_dispatch:
 
@@ -39,10 +41,10 @@ jobs:
         working-directory: api
         run: pytest
 
-  # Builds and deploys only from the transaction-feature branch, and only after the tests pass.
+  # Builds and deploys only from a push to main, and only after the tests pass.
   deploy:
     needs: test
-    if: github.ref == 'refs/heads/transaction-feature' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
