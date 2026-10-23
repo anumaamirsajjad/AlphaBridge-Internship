@@ -12,3 +12,11 @@ api/.coverage
 
 # Generated data file (created by a script, not written by hand).
 api/pending-ids-5000.js
+
+# Terraform working files. The state lives in S3, never in Git. The lock file
+# (.terraform.lock.hcl) is committed on purpose, so every run uses the same provider versions.
+infra/.terraform/
+infra/*.tfstate
+infra/*.tfstate.*
+infra/crash.log
+infra/*.tfplan

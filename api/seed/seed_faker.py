@@ -1,12 +1,15 @@
 """Fill the database with fake bank data for testing.
 
 What this file does:
-    Creates the tables if they are missing, then adds fake accounts, transfers,
-    pending and cancelled transfers, and refunds. Balances follow the same rules
-    as the API, so no account goes negative. It also creates one demo API client
-    that can use the first 20 accounts, and prints its API key once.
+    First run: creates the tables if they are missing, creates fake accounts and
+    one demo API client, then adds transfers until the transactions table reaches
+    TRANSACTION_TARGET rows.
 
-    It refuses to run if the accounts table already has rows.
+    Later runs: reads the accounts that already exist and adds transfers until the
+    target is reached again. Nothing is added if the target is already reached.
+
+    Balances follow the same rules as the API, so no account goes negative. The
+    balances are saved after every batch, so a stopped run can be started again.
 
 Run it inside the VPC, because the database is private. Use the seed image
 (see api/Dockerfile.seed). Locally, from the api folder:
@@ -26,14 +29,23 @@ from faker import Faker
 from business.banking import hash_api_key
 from data.database import connect
 
+TRANSACTION_TARGET = int(os.getenv("TRANSACTION_TARGET", "1000000"))
+BATCH_SIZE = 50_000
 ACCOUNT_COUNT = 200
-COMPLETED_COUNT = 5000
-PENDING_COUNT = 300
-CANCELLED_COUNT = 100
-REFUND_COUNT = 150
 DEMO_CLIENT_ACCOUNTS = 20
 CURRENCIES = ["USD", "PKR"]
 HISTORY_DAYS = 90
+PENDING_SHARE = 0.05
+CANCELLED_SHARE = 0.02
+REFUND_SHARE = 0.03  # share of the completed transfers in each batch that are refunded
+
+DESCRIPTIONS = [
+    "Rent payment", "Grocery shopping", "Salary transfer", "Utility bill", "School fees",
+    "Medical bill", "Loan repayment", "Gift", "Fuel", "Restaurant bill",
+    "Mobile top-up", "Insurance premium", "Savings transfer", "Online order", "Tuition",
+]
+REFUND_REASONS = ["Item returned", "Duplicate payment", "Service not delivered", "Wrong amount", "Customer request"]
+CANCEL_REASON = "Cancelled by requester"
 
 # Where the schema files are. The seed image copies them to /init.
 SCHEMA_DIR = Path(os.getenv("SCHEMA_DIR", "/init"))
@@ -51,6 +63,10 @@ def apply_schema(conn):
 # A random amount with two decimal places, between low and high.
 def random_amount(low, high):
     return Decimal(str(round(random.uniform(low, high), 2))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def random_time(start, end):
+    return start + timedelta(seconds=random.uniform(0, (end - start).total_seconds()))
 
 
 # Two different accounts in the same currency, so the transfer is valid.
@@ -74,55 +90,50 @@ def make_accounts(fake, now):
     return accounts
 
 
-# Completed transfers move money now, in time order, so balances never go negative.
-def make_completed(by_currency, now):
+def load_accounts(conn):
+    rows = conn.execute("SELECT account_id, currency, balance FROM accounts").fetchall()
+    return [
+        {"id": r["account_id"], "currency": r["currency"].strip(), "balance": r["balance"]}
+        for r in rows
+    ]
+
+
+# Builds one batch of transfers. Completed transfers move money now, in the order they are made,
+# so no balance goes negative. Pending and cancelled transfers never move money, matching the API.
+def make_batch(by_currency, accounts_by_id, now, count):
     start = now - timedelta(days=HISTORY_DAYS)
-    seconds = sorted(random.uniform(0, (now - start).total_seconds()) for _ in range(COMPLETED_COUNT))
-    rows = []
-    for offset in seconds:
+    pending_n = int(count * PENDING_SHARE)
+    cancelled_n = int(count * CANCELLED_SHARE)
+    completed_n = count - pending_n - cancelled_n
+
+    transactions = []
+    for _ in range(completed_n):
         source, destination = pick_pair(by_currency)
         if source["balance"] <= 0:
             continue
         amount = min(random_amount(1, 500), source["balance"])
         source["balance"] -= amount
         destination["balance"] += amount
-        created = start + timedelta(seconds=offset)
-        rows.append({
-            "id": uuid.uuid4(),
-            "from": source["id"],
-            "to": destination["id"],
-            "amount": amount,
-            "currency": source["currency"],
-            "status": "completed",
-            "created_at": created,
-            "updated_at": created,
+        created = random_time(start, now)
+        transactions.append({
+            "id": uuid.uuid4(), "from": source["id"], "to": destination["id"], "amount": amount,
+            "currency": source["currency"], "status": "completed", "created_at": created, "updated_at": created,
         })
-    return rows
 
+    for status, number in (("pending", pending_n), ("cancelled", cancelled_n)):
+        for _ in range(number):
+            source, destination = pick_pair(by_currency)
+            created = random_time(start, now)
+            transactions.append({
+                "id": uuid.uuid4(), "from": source["id"], "to": destination["id"],
+                "amount": random_amount(1, 500), "currency": source["currency"], "status": status,
+                "created_at": created, "updated_at": created,
+            })
 
-# Pending and cancelled transfers never move money, matching the API.
-def make_open_transfers(by_currency, now, count, status):
-    rows = []
-    for _ in range(count):
-        source, destination = pick_pair(by_currency)
-        created = now - timedelta(seconds=random.uniform(0, 7 * 24 * 3600))
-        rows.append({
-            "id": uuid.uuid4(),
-            "from": source["id"],
-            "to": destination["id"],
-            "amount": random_amount(1, 500),
-            "currency": source["currency"],
-            "status": status,
-            "created_at": created,
-            "updated_at": created,
-        })
-    return rows
-
-
-# Refunds move money back from the receiver to the sender, and mark the transfer refunded.
-def make_refunds(fake, completed, accounts_by_id, now):
+    # Refunds move the money back from the receiver to the sender, and mark the transfer refunded.
+    completed = [t for t in transactions if t["status"] == "completed"]
     refunds = []
-    for tx in random.sample(completed, min(REFUND_COUNT, len(completed))):
+    for tx in random.sample(completed, int(len(completed) * REFUND_SHARE)):
         receiver = accounts_by_id[tx["to"]]
         sender = accounts_by_id[tx["from"]]
         if receiver["balance"] < tx["amount"]:
@@ -133,25 +144,18 @@ def make_refunds(fake, completed, accounts_by_id, now):
         tx["status"] = "refunded"
         tx["updated_at"] = refunded_at
         refunds.append({
-            "id": uuid.uuid4(),
-            "transaction_id": tx["id"],
-            "amount": tx["amount"],
-            "reason": fake.sentence(nb_words=5)[:255],
-            "created_at": refunded_at,
+            "id": uuid.uuid4(), "transaction_id": tx["id"], "amount": tx["amount"],
+            "reason": random.choice(REFUND_REASONS), "created_at": refunded_at,
         })
-    return refunds
 
-
-def make_cancellations(cancelled, now):
-    rows = []
-    for tx in cancelled:
-        rows.append({
-            "id": uuid.uuid4(),
-            "transaction_id": tx["id"],
-            "reason": "Cancelled by requester",
-            "created_at": min(tx["created_at"] + timedelta(hours=random.uniform(1, 24)), now),
-        })
-    return rows
+    cancellations = []
+    for tx in transactions:
+        if tx["status"] == "cancelled":
+            cancellations.append({
+                "id": uuid.uuid4(), "transaction_id": tx["id"], "reason": CANCEL_REASON,
+                "created_at": min(tx["created_at"] + timedelta(hours=random.uniform(1, 24)), now),
+            })
+    return transactions, refunds, cancellations
 
 
 # COPY is the fastest way to load many rows into PostgreSQL.
@@ -163,73 +167,92 @@ def copy_rows(conn, table, columns, rows):
             copy.write_row(row)
 
 
+# Saves every account's balance, so the database matches the transfers just added.
+def save_balances(conn, accounts):
+    with conn.cursor() as cur:
+        cur.executemany(
+            "UPDATE accounts SET balance = %s WHERE account_id = %s",
+            [(a["balance"], a["id"]) for a in accounts],
+        )
+
+
+def create_demo_client(conn, accounts):
+    api_key = secrets.token_urlsafe(32)
+    client_id = conn.execute(
+        "INSERT INTO api_clients (name, key_hash) VALUES (%s, %s) RETURNING client_id",
+        ("Demo client", hash_api_key(api_key)),
+    ).fetchone()["client_id"]
+    for account in accounts[:DEMO_CLIENT_ACCOUNTS]:
+        conn.execute(
+            "INSERT INTO client_accounts (client_id, account_id) VALUES (%s, %s)",
+            (client_id, account["id"]),
+        )
+    print(f"Demo API key (shown once, copy it now): {api_key}")
+
+
 def main():
     fake = Faker()
     now = datetime.now(timezone.utc)
 
     with connect() as conn:
         apply_schema(conn)
-        if conn.execute("SELECT COUNT(*) AS n FROM accounts").fetchone()["n"] > 0:
-            raise SystemExit("Accounts already exist. Nothing was added.")
-
-        accounts = make_accounts(fake, now)
-        accounts_by_id = {a["id"]: a for a in accounts}
-        by_currency = {}
-        for account in accounts:
-            by_currency.setdefault(account["currency"], []).append(account)
-
-        completed = make_completed(by_currency, now)
-        pending = make_open_transfers(by_currency, now, PENDING_COUNT, "pending")
-        cancelled = make_open_transfers(by_currency, now, CANCELLED_COUNT, "cancelled")
-        refunds = make_refunds(fake, completed, accounts_by_id, now)
-        cancellations = make_cancellations(cancelled, now)
-
-        copy_rows(
-            conn, "accounts",
-            ["account_id", "account_holder", "currency", "balance", "created_at"],
-            [(a["id"], a["holder"], a["currency"], a["balance"], a["created_at"]) for a in accounts],
-        )
-
-        transfer_rows = []
-        for tx in completed + pending + cancelled:
-            transfer_rows.append((
-                tx["id"], tx["from"], tx["to"], tx["amount"], tx["currency"],
-                fake.sentence(nb_words=4)[:255], tx["status"], tx["created_at"], tx["updated_at"], 1,
-            ))
-        copy_rows(
-            conn, "transactions",
-            ["transaction_id", "from_account_id", "to_account_id", "amount", "currency",
-             "description", "status", "created_at", "updated_at", "version"],
-            transfer_rows,
-        )
-        copy_rows(
-            conn, "refunds",
-            ["refund_id", "transaction_id", "amount", "reason", "status", "created_at"],
-            [(r["id"], r["transaction_id"], r["amount"], r["reason"], "processed", r["created_at"]) for r in refunds],
-        )
-        copy_rows(
-            conn, "cancellations",
-            ["cancellation_id", "transaction_id", "reason", "status", "created_at"],
-            [(c["id"], c["transaction_id"], c["reason"], "completed", c["created_at"]) for c in cancellations],
-        )
-
-        # One demo client that can send money from the first accounts.
-        api_key = secrets.token_urlsafe(32)
-        client_id = conn.execute(
-            "INSERT INTO api_clients (name, key_hash) VALUES (%s, %s) RETURNING client_id",
-            ("Demo client", hash_api_key(api_key)),
-        ).fetchone()["client_id"]
-        for account in accounts[:DEMO_CLIENT_ACCOUNTS]:
-            conn.execute(
-                "INSERT INTO client_accounts (client_id, account_id) VALUES (%s, %s)",
-                (client_id, account["id"]),
+        first_run = conn.execute("SELECT COUNT(*) AS n FROM accounts").fetchone()["n"] == 0
+        if first_run:
+            accounts = make_accounts(fake, now)
+            copy_rows(
+                conn, "accounts",
+                ["account_id", "account_holder", "currency", "balance", "created_at"],
+                [(a["id"], a["holder"], a["currency"], a["balance"], a["created_at"]) for a in accounts],
             )
+            create_demo_client(conn, accounts)
+        else:
+            accounts = load_accounts(conn)
+            print(f"Using {len(accounts)} existing accounts.")
 
-    print(f"Accounts: {len(accounts)}")
-    print(f"Transactions: {len(completed) + len(pending) + len(cancelled)} "
-          f"(completed {len(completed)}, pending {len(pending)}, cancelled {len(cancelled)})")
-    print(f"Refunds: {len(refunds)}")
-    print(f"Demo API key (shown once, copy it now): {api_key}")
+    by_currency = {}
+    for account in accounts:
+        by_currency.setdefault(account["currency"], []).append(account)
+    accounts_by_id = {a["id"]: a for a in accounts}
+
+    with connect() as conn:
+        existing = conn.execute("SELECT COUNT(*) AS n FROM transactions").fetchone()["n"]
+    remaining = TRANSACTION_TARGET - existing
+    print(f"Transactions now: {existing}. Target: {TRANSACTION_TARGET}. To add: {max(remaining, 0)}.")
+
+    batch_number = 0
+    while remaining > 0:
+        count = min(BATCH_SIZE, remaining)
+        transactions, refunds, cancellations = make_batch(by_currency, accounts_by_id, now, count)
+        batch_number += 1
+
+        with connect() as conn:
+            copy_rows(
+                conn, "transactions",
+                ["transaction_id", "from_account_id", "to_account_id", "amount", "currency",
+                 "description", "status", "created_at", "updated_at", "version"],
+                [
+                    (t["id"], t["from"], t["to"], t["amount"], t["currency"],
+                     random.choice(DESCRIPTIONS), t["status"], t["created_at"], t["updated_at"], 1)
+                    for t in transactions
+                ],
+            )
+            copy_rows(
+                conn, "refunds",
+                ["refund_id", "transaction_id", "amount", "reason", "status", "created_at"],
+                [(r["id"], r["transaction_id"], r["amount"], r["reason"], "processed", r["created_at"]) for r in refunds],
+            )
+            copy_rows(
+                conn, "cancellations",
+                ["cancellation_id", "transaction_id", "reason", "status", "created_at"],
+                [(c["id"], c["transaction_id"], c["reason"], "completed", c["created_at"]) for c in cancellations],
+            )
+            save_balances(conn, accounts)
+
+        remaining -= count
+        print(f"Batch {batch_number}: added {len(transactions)} transactions, {len(refunds)} refunds, "
+              f"{len(cancellations)} cancellations. Still to add: {max(remaining, 0)}.")
+
+    print("Done.")
 
 
 if __name__ == "__main__":
