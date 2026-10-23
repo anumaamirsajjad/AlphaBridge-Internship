@@ -16,10 +16,8 @@ permissions:
 env:
   AWS_REGION: ap-south-1
   ECR_REPOSITORY: alphabridge-api
-  ECS_CLUSTER: alphabridge-cluster
-  ECS_SERVICE: alphabridge-api-service
-  ECS_TASK_FAMILY: alphabridge-api
-  CONTAINER_NAME: alphabridge-api
+  LAUNCH_TEMPLATE: alphabridge-app-lt
+  AUTO_SCALING_GROUP: alphabridge-asg
 
 jobs:
   # Runs the unit tests on develop and on pull requests into develop. Nothing is deployed from here.
@@ -43,8 +41,12 @@ jobs:
         working-directory: api
         run: pytest
 
-  # Builds and deploys only from a push to main. Code reaches main only through develop,
-  # where the tests already ran, so this job does not wait for the test job.
+  # Builds the image, points the launch template at it, and replaces the servers one at a time.
+  # Code reaches main only through develop, where the tests already ran, so this job does not wait for them.
+  #
+  # The deploy role needs these permissions besides ECR: ec2:DescribeLaunchTemplateVersions,
+  # ec2:CreateLaunchTemplateVersion, autoscaling:StartInstanceRefresh,
+  # autoscaling:DescribeInstanceRefreshes, and iam:PassRole for alphabridge-app-ec2.
   deploy:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -66,34 +68,50 @@ jobs:
       # Tags each image with the commit ID, so every deploy is traceable.
       - name: Build and push image
         env:
-          REGISTRY: ${{ steps.ecr.outputs.registry }}
           IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
         working-directory: api
         run: |
           docker build -t "$IMAGE" .
           docker push "$IMAGE"
 
-      # Copies the current task definition and removes the fields ECS won't accept on register.
-      - name: Download current task definition
+      # Writes a new launch template version that starts this commit's image.
+      # The current template is copied, and only its startup script changes.
+      - name: Create launch template version for this image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
         run: |
-          aws ecs describe-task-definition --task-definition "$ECS_TASK_FAMILY" --query taskDefinition \
-            | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
-            > task-definition.json
+          cat > user-data.sh <<EOF
+          #!/bin/bash
+          dnf install -y docker
+          systemctl enable --now docker
+          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REGISTRY
+          DATABASE_URL=\$(aws secretsmanager get-secret-value --region $AWS_REGION --secret-id alphabridge/database-url --query SecretString --output text)
+          docker run -d --name alphabridge-api --restart unless-stopped -p 8000:8000 --log-driver=awslogs --log-opt awslogs-region=$AWS_REGION --log-opt awslogs-group=/alphabridge/app --log-opt awslogs-stream=api -e DATABASE_URL="\$DATABASE_URL" -e PGSSLMODE=require $IMAGE
+          EOF
+          aws ec2 describe-launch-template-versions --launch-template-name "$LAUNCH_TEMPLATE" --versions '$Latest' \
+            --query 'LaunchTemplateVersions[0].LaunchTemplateData' > current.json
+          jq --arg ud "$(base64 -w0 user-data.sh)" '.UserData = $ud' current.json > new.json
+          aws ec2 create-launch-template-version --launch-template-name "$LAUNCH_TEMPLATE" \
+            --version-description "$GITHUB_SHA" --launch-template-data file://new.json
 
-      - name: Point container at the new image
-        id: render
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
-        with:
-          task-definition: task-definition.json
-          container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+      # Replaces the servers one at a time. At least half stay in service during the refresh,
+      # and the load balancer drains each old server before it is removed.
+      - name: Start instance refresh
+        run: |
+          aws autoscaling start-instance-refresh --auto-scaling-group-name "$AUTO_SCALING_GROUP" \
+            --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 120}'
 
-      # Registers the new revision and updates the service. Waits until the service is stable.
-      # If the new tasks fail, the ECS circuit breaker rolls back to the last working revision.
-      - name: Deploy to ECS
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
-        with:
-          task-definition: ${{ steps.render.outputs.task-definition }}
-          service: ${{ env.ECS_SERVICE }}
-          cluster: ${{ env.ECS_CLUSTER }}
-          wait-for-service-stability: true
+      - name: Wait for the refresh to finish
+        run: |
+          for i in $(seq 1 60); do
+            STATUS=$(aws autoscaling describe-instance-refreshes --auto-scaling-group-name "$AUTO_SCALING_GROUP" \
+              --query 'InstanceRefreshes[0].Status' --output text)
+            echo "Refresh status: $STATUS"
+            case "$STATUS" in
+              Successful) exit 0 ;;
+              Failed|Cancelled) exit 1 ;;
+            esac
+            sleep 30
+          done
+          exit 1
