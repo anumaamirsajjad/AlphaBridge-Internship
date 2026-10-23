@@ -1,0 +1,24 @@
+# Image for loading fake test data. Build from the project root:
+#   docker build -f api/Dockerfile.seed -t alphabridge-seed:1 .
+# Run it once against the database, from a server inside the VPC.
+
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# Install the packages first, so this layer is reused when only code changes.
+COPY api/requirements-seed.txt api/requirements.txt ./
+RUN pip install -r requirements-seed.txt
+
+# The code the seeder needs, and the schema files it creates the tables from.
+COPY api/business/ ./business/
+COPY api/data/ ./data/
+COPY api/validation/ ./validation/
+COPY api/seed/ ./seed/
+COPY init/ /init/
+
+CMD ["python", "-m", "seed.seed_faker"]
