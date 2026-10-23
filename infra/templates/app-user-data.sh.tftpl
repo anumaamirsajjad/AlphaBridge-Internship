@@ -1,0 +1,10 @@
+#!/bin/bash
+# Runs once when an app server starts. It installs Docker, logs in to ECR, reads the database
+# connection string from Secrets Manager, and starts the API container.
+#
+# Terraform fills in the placeholder values (region, registry, log group, image tag) before this script goes onto each server.
+dnf install -y docker
+systemctl enable --now docker
+aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${registry}
+DATABASE_URL=$(aws secretsmanager get-secret-value --region ${region} --secret-id alphabridge/database-url --query SecretString --output text)
+docker run -d --name alphabridge-api --restart unless-stopped -p 8000:8000 --log-driver=awslogs --log-opt awslogs-region=${region} --log-opt awslogs-group=${log_group} --log-opt awslogs-stream=api -e DATABASE_URL="$DATABASE_URL" -e PGSSLMODE=require ${registry}/alphabridge-api:${image_tag}
