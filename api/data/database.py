@@ -37,7 +37,7 @@ def database_is_available() -> bool:
         with connect() as conn:
             conn.execute("SELECT 1")
         return True
-    except (psycopg.Error, RuntimeError):
-        # Writes the real error to the logs. The caller only sees "unavailable".
-        logger.exception("Database health check failed")
+    except (psycopg.Error, RuntimeError) as error:
+        # Logs only the error type. The message and traceback can contain the connection string.
+        logger.error("Database health check failed: %s", type(error).__name__)
         return False
