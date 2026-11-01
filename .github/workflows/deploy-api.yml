@@ -93,6 +93,54 @@ jobs:
           docker build -t "$IMAGE" .
           docker push "$IMAGE"
 
+      # Builds the Flyway image with the migration files. It shares the repository, tagged flyway-<commit ID>.
+      - name: Build and push migration image
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:flyway-${{ github.sha }}
+        working-directory: db
+        run: |
+          docker build -f Dockerfile.flyway -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      # Runs the migrations before the new servers start. The command runs on one in-service app server,
+      # which already holds DATABASE_URL, so the connection string never leaves the server.
+      # Migrations are additive, so the old servers keep working while this runs.
+      - name: Run database migrations on an app server
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:flyway-${{ github.sha }}
+        run: |
+          INSTANCE=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names alphabridge-asg \
+            --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService'] | [0].InstanceId" --output text)
+          PARAMS=$(jq -n --arg r "$REGISTRY" --arg i "$IMAGE" '{commands: [
+            ("aws ecr get-login-password --region " + env.AWS_REGION + " | docker login --username AWS --password-stdin " + $r),
+            ("docker pull " + $i),
+            "CID=$(docker ps -q | head -n 1)",
+            "URL=$(docker exec $CID printenv DATABASE_URL)",
+            ("docker run --rm -e DATABASE_URL=$URL " + $i)
+          ]}')
+          COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE" --document-name AWS-RunShellScript \
+            --comment "Flyway migrations for ${{ github.sha }}" --timeout-seconds 1800 \
+            --parameters "$PARAMS" --query "Command.CommandId" --output text)
+
+          # Waits for the migrations to finish. A long index build can take several minutes.
+          STATUS=Pending
+          for _ in $(seq 1 120); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in
+              Pending|InProgress|Delayed) sleep 15 ;;
+              *) break ;;
+            esac
+          done
+
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE" \
+            --query "{Output:StandardOutputContent,Error:StandardErrorContent}" --output text
+          if [ "$STATUS" != "Success" ]; then
+            echo "Migrations finished with status $STATUS. Stopping the deploy."
+            exit 1
+          fi
+
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:

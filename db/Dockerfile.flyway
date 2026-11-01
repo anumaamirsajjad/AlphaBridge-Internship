@@ -1,0 +1,7 @@
+# Flyway image that carries the migration files. Built in the deploy job, then run on an app server.
+FROM flyway/flyway:10.17.0-alpine
+
+COPY migration /flyway/sql
+COPY migrate.sh /usr/local/bin/migrate.sh
+
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/migrate.sh"]
