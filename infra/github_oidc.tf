@@ -28,10 +28,12 @@ data "aws_iam_policy_document" "github_deploy_trust" {
     }
 
     # Only a push to main in this repo may assume the role. Nothing else, including other branches.
+    # The subject uses GitHub's immutable format, which includes the owner's and repo's numeric IDs.
+    # The plain "owner/repo" form is rejected for this repository.
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:anumaamirsajjad/alphabridge-internship:ref:refs/heads/main"]
+      values   = ["repo:anumaamirsajjad@151608625/alphabridge-internship@1428348870:ref:refs/heads/main"]
     }
   }
 }
