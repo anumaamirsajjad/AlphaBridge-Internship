@@ -26,4 +26,9 @@ export FLYWAY_URL="jdbc:postgresql://${hostport}/${dbname}${query}"
 export FLYWAY_USER="$user"
 export FLYWAY_PASSWORD="$password"
 
-exec /flyway/flyway -connectRetries=3 migrate
+# Runs "migrate" unless another Flyway command is given, for example: baseline -baselineVersion=3
+if [ $# -eq 0 ]; then
+    set -- migrate
+fi
+
+exec /flyway/flyway -connectRetries=3 "$@"
